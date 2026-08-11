@@ -27,7 +27,7 @@ inputs:
       Safety cap on the number of hosts after CIDR/range expansion.
       Raise this for large-scale scans (e.g. 50000 for tens of thousands of targets).
     required: false
-    default: "20000"
+    default: "20000000"
   workers:
     description: >-
       Number of parallel processes to shard the target list across.
