@@ -41,7 +41,7 @@ on:
         required: false
       max-hosts:
         description: "Safety cap on expanded host count — set to match your real, authorized target list"
-        default: "50000"
+        default: "200000000"
         required: false
       chunk-size:
         description: "Hosts scanned per checkpoint. Smaller = safer resume granularity, more overhead; larger = fewer checkpoints, more rework if a chunk gets killed mid-way"
