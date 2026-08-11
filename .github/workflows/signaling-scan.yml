@@ -76,6 +76,18 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # Fallback for the "Maximum call stack size exceeded" crash inside
+  # actions/upload-artifact when GitHub's runners default to Node 24.
+  # The tarball change below already removes the most-documented
+  # trigger (a glob path expanding to many files), but the crash in
+  # the log fires immediately on "Run actions/upload-artifact@v4" —
+  # before any file-globbing output — which points to a Node-24-runtime
+  # regression in the action's own startup rather than a file-count
+  # issue. This is GitHub's own escape hatch: it forces actions on this
+  # workflow back onto Node 20 until upstream ships a Node-24-compatible
+  # release. Remove it once you've confirmed runs are stable, since
+  # Node 20 itself is on a deprecation path.
+  ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: "true"
   TRANSPORT: all
   WORKERS: "4"
   CONCURRENCY: "500"
@@ -123,6 +135,13 @@ jobs:
           done
           sudo modprobe sctp || echo "::warning::failed to load the sctp kernel module — SIGTRAN protocols will report ERROR."
 
+      # actions/upload-artifact@v4's glob resolution is known to throw
+      # "Maximum call stack size exceeded" once a path/pattern expands to
+      # a large number of files (github.com/actions/upload-artifact/issues/653,
+      # .../issues/511) — chunks/ can easily be hundreds of small files for
+      # a large target list. Checkpointing through a single tarball instead
+      # of raw directory globs sidesteps that entirely: upload-artifact
+      # only ever sees one file.
       - name: Restore checkpoint from previous run
         if: inputs.iteration != '1'
         uses: actions/download-artifact@v4
@@ -131,6 +150,10 @@ jobs:
           run-id: ${{ inputs.resume-run-id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: .
+
+      - name: Unpack restored checkpoint
+        if: inputs.iteration != '1'
+        run: tar -xzf checkpoint.tar.gz
 
       - name: Prepare chunks (first iteration only)
         if: inputs.iteration == '1'
@@ -184,15 +207,16 @@ jobs:
           echo "cursor=$cursor" >> "$GITHUB_OUTPUT"
           echo "total-chunks=$total_chunks" >> "$GITHUB_OUTPUT"
 
+      - name: Pack checkpoint
+        if: always()
+        run: tar -czf checkpoint.tar.gz state.env chunks results/merged.ndjson
+
       - name: Upload checkpoint
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: signaling-scan-state
-          path: |
-            state.env
-            chunks/
-            results/merged.ndjson
+          path: checkpoint.tar.gz
           retention-days: 3
 
       - name: Dispatch next iteration
