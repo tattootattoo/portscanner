@@ -1,0 +1,32 @@
+# Example: periodic monitoring of telecom signaling-element exposure on
+# your network — copy this file into your project (.github/workflows/)
+# and adjust host/hosts-file for your environment. Needs a runner with
+# actual network access to your elements (usually a self-hosted runner
+# inside the same network, not the public GitHub-hosted runner).
+
+name: Signaling Exposure Monitor
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch: {}      # manual trigger when needed
+
+jobs:
+  scan:
+    runs-on: self-hosted   # must be inside the same network as your elements
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan telecom signaling exposure
+        id: scan
+        uses: ./  # or the full path if the tool is in a separate repo: org/portscanner@main
+        with:
+          hosts-file: targets.txt
+          transport: all
+          extra-args: "--retries 1 --fast-timeout 1.0"
+
+      - name: Fail if unexpected ports found
+        if: steps.scan.outputs.open-count > 5   # adjust the expected threshold for your network
+        run: |
+          echo "⚠️ number of open signaling ports higher than expected: ${{ steps.scan.outputs.open-count }}"
+          exit 1

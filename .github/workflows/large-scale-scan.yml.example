@@ -1,0 +1,60 @@
+# Example: large-scale scan (tens of thousands of targets) with full
+# SIGTRAN/SCTP support. Copy into your project as
+# .github/workflows/large-scale-scan.yml and adjust hosts-file/schedule.
+#
+# Notes:
+#  - runs-on: self-hosted is required if your targets are on a private
+#    network. If your targets are internet-reachable, ubuntu-latest works.
+#  - SCTP kernel module support on GitHub-hosted runners can vary by image;
+#    the action's "Enable real SCTP support" step will print a clear
+#    ::warning:: if modprobe fails so you know SIGTRAN results are ERROR
+#    rather than silently wrong.
+#  - timeout-minutes on the step (not inside action.yml) is the way to
+#    bound a run that could otherwise hang on a huge target list.
+
+name: Large-Scale Signaling Scan
+
+on:
+  schedule:
+    - cron: "0 3 * * *"      # once a day
+  workflow_dispatch:
+    inputs:
+      hosts-file:
+        description: "Path to targets file in the repo"
+        default: "targets.txt"
+        required: false
+
+jobs:
+  scan:
+    runs-on: self-hosted        # use ubuntu-latest only if targets are public/internet-reachable
+    timeout-minutes: 90         # hard ceiling for the whole job — adjust to your target-list size
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan telecom signaling exposure (tens of thousands of targets)
+        id: scan
+        timeout-minutes: 80      # step-level ceiling, a bit under the job timeout
+        uses: ./                 # or org/portscanner@main if the action lives in a separate repo
+        with:
+          hosts-file: ${{ github.event.inputs.hosts-file || 'targets.txt' }}
+          transport: all
+          max-hosts: "50000"             # raise the default 20000 cap for very large lists
+          workers: "4"                    # match to the runner's core count
+          concurrency: "800"              # deep-confirmation phase concurrency (auto-capped to ulimit)
+          adaptive-max-concurrency: "2000"
+          enable-sctp: "true"             # needed for M3UA/SUA/M2UA/M2PA/IUA/V5UA
+          output-format: "ndjson"         # streams to disk, doesn't buffer the whole result set in RAM
+          output-file: "scan-results.ndjson"
+          extra-args: "--retries 1 --fast-timeout 0.6 --min-delay-per-host 0.05"
+
+      - name: Report
+        run: |
+          echo "scanned: ${{ steps.scan.outputs.scanned-count }}"
+          echo "open:    ${{ steps.scan.outputs.open-count }}"
+          echo "confirmed protocols: ${{ steps.scan.outputs.confirmed-count }}"
+
+      - name: Fail if unexpected exposure found
+        if: steps.scan.outputs.open-count > 20   # adjust the expected threshold for your network
+        run: |
+          echo "⚠️ number of open signaling ports higher than expected: ${{ steps.scan.outputs.open-count }}"
+          exit 1

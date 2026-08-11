@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # lksctp-tools so socket.IPPROTO_SCTP is actually available during
+      # the tests (some transports/sctp.py tests check for its availability).
+      - name: Install lksctp-tools
+        run: sudo apt-get update && sudo apt-get install -y lksctp-tools libsctp-dev
+
+      - name: Install package + dev dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check src tests
+
+      - name: Type-check (mypy)
+        run: mypy src --ignore-missing-imports
+        continue-on-error: true  # tightening incrementally; doesn't fail CI yet
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+      # Confirms the plugin architecture (entry_points) actually works
+      # in a real CI environment, not just internal logic tested in
+      # isolation — installs the RADIUS example and checks it shows up
+      # automatically in the protocol list.
+      - name: Verify plugin architecture end-to-end
+        run: |
+          pip install -e examples/example-protocol-plugin
+          portscanner --list-protocols | grep -q "RADIUS" && \
+            echo "✓ RADIUS plugin loaded automatically" || \
+            (echo "✗ failed to load the RADIUS plugin" && exit 1)
+
+      # Confirms --check-env runs without exceptions on a real runner,
+      # and prints useful diagnostics right in the CI logs (SCTP is
+      # actually available here thanks to the lksctp-tools step above,
+      # unlike some other development environments).
+      - name: Environment diagnostics
+        run: portscanner --check-env

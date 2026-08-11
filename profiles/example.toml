@@ -1,0 +1,15 @@
+# An example scan profile — use with: portscanner --profile profiles/example.toml
+# Any explicit CLI flag overrides the values here (precedence: CLI > this file > built-in defaults)
+[scan]
+host = "10.0.0.0/24"
+ports = "2123,2152,2904,2905,3868,3869,5060,5061,14001"
+transport = "all"
+concurrency = 300
+fast_timeout = 0.5       # the fast-discovery phase (phase 1)
+fast_concurrency = 1500
+connect_timeout = 2.5    # the deep-confirmation phase (phase 2) — higher accuracy
+retries = 2
+retry_delay = 0.5
+output = "json"
+output_file = "scan-results.json"
+no_progress = true

@@ -1,0 +1,218 @@
+name: "Telecom Signaling Protocol Scanner"
+description: >-
+  Scans and confirms telecom signaling protocols (Diameter, SIGTRAN, GTP-C/U, SIP/IMS)
+  as a step inside any GitHub Actions workflow — tuned for large target lists
+  (tens of thousands of hosts) with real SCTP/SIGTRAN support, streaming
+  NDJSON output, and multi-process sharding.
+
+author: "portscanner"
+
+inputs:
+  host:
+    description: "A single target: IP/domain/CIDR/range"
+    required: false
+  hosts-file:
+    description: "Path to a target-list file (an alternative to host) — one host/CIDR/range per line"
+    required: false
+  ports:
+    description: "Ports to scan (default: the standard signaling ports)"
+    required: false
+    default: ""
+  transport:
+    description: "tcp/udp/sctp/all"
+    required: false
+    default: "all"
+  max-hosts:
+    description: >-
+      Safety cap on the number of hosts after CIDR/range expansion.
+      Raise this for large-scale scans (e.g. 50000 for tens of thousands of targets).
+    required: false
+    default: "20000"
+  workers:
+    description: >-
+      Number of parallel processes to shard the target list across.
+      For tens of thousands of targets on a GitHub-hosted runner (4 cores on
+      ubuntu-latest), 4 is a reasonable default; raise to match runner cores.
+    required: false
+    default: "4"
+  concurrency:
+    description: "Max concurrency for the deep-confirmation phase (auto-capped to the runner's ulimit -n)"
+    required: false
+    default: "500"
+  adaptive-max-concurrency:
+    description: "Upper bound for the self-adapting fast-discovery phase concurrency"
+    required: false
+    default: "1500"
+  enable-sctp:
+    description: >-
+      Whether to install lksctp-tools and load the SCTP kernel module before
+      scanning, so SIGTRAN (M3UA/SUA/M2UA/M2PA/IUA/V5UA) actually works
+      instead of returning ERROR. Set to "false" to skip (saves ~10-15s)
+      when you know you're only scanning tcp/udp protocols.
+    required: false
+    default: "true"
+  output-format:
+    description: >-
+      table/json/csv/ndjson. ndjson (default) streams one result per line as
+      it completes and is the recommended format for large target lists —
+      it avoids buffering the whole result set into a single JSON blob and
+      lets you see partial results even if the job is cancelled or times out.
+    required: false
+    default: "ndjson"
+  output-file:
+    description: "Path to save results"
+    required: false
+    default: "portscanner-results.ndjson"
+  extra-args:
+    description: "Any extra CLI flags (e.g. --retries 2 --profile my.toml)"
+    required: false
+    default: ""
+  python-version:
+    description: "Python version to use"
+    required: false
+    default: "3.12"
+
+outputs:
+  results-file:
+    description: "Path to the results file"
+    value: ${{ steps.scan.outputs.results-file }}
+  open-count:
+    description: "Number of open ports discovered"
+    value: ${{ steps.scan.outputs.open-count }}
+  scanned-count:
+    description: "Total number of target checks scanned"
+    value: ${{ steps.scan.outputs.scanned-count }}
+  confirmed-count:
+    description: "Number of results with a confirmed protocol"
+    value: ${{ steps.scan.outputs.confirmed-count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: "pip"
+
+    - name: Install portscanner
+      shell: bash
+      run: pip install -e "${{ github.action_path }}"
+
+    - name: Enable real SCTP support (for SIGTRAN)
+      if: inputs.enable-sctp == 'true'
+      shell: bash
+      run: |
+        set -e
+        echo "[*] installing lksctp-tools + loading the sctp kernel module ..."
+        for i in 1 2 3; do
+          # apt-get update against the runner's mirrors is the flakiest
+          # step in this whole job (transient DNS/network hiccups on
+          # shared GitHub-hosted runners) — retry a few times with a
+          # short backoff instead of failing the whole scan on a blip
+          # that would very likely succeed on the next try.
+          if sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends lksctp-tools libsctp-dev; then
+            break
+          fi
+          if [ "$i" = "3" ]; then
+            echo "::warning::apt-get failed 3 times — continuing without lksctp-tools; SIGTRAN protocols will report ERROR."
+          else
+            echo "[*] apt-get attempt $i failed, retrying in 5s ..."
+            sleep 5
+          fi
+        done
+        sudo modprobe sctp || echo "::warning::failed to load the sctp kernel module — SIGTRAN protocols will report ERROR. This runner's kernel may not support it; try a different runner image."
+        if [ -f /proc/net/sctp/snmp ] || grep -qi sctp /proc/modules 2>/dev/null; then
+          echo "[*] SCTP is active — SIGTRAN protocols will be scanned for real."
+        else
+          echo "::warning::SCTP support could not be confirmed after modprobe — SIGTRAN scans may still report ERROR."
+        fi
+
+    - name: Environment diagnostics
+      shell: bash
+      run: portscanner --check-env
+
+    - name: Run scan
+      id: scan
+      shell: bash
+      run: |
+        set -e
+        ARGS=()
+        if [ -n "${{ inputs.host }}" ]; then ARGS+=(--host "${{ inputs.host }}"); fi
+        if [ -n "${{ inputs.hosts-file }}" ]; then ARGS+=(--hosts-file "${{ inputs.hosts-file }}"); fi
+        if [ -n "${{ inputs.ports }}" ]; then ARGS+=(--ports "${{ inputs.ports }}"); fi
+        ARGS+=(--transport "${{ inputs.transport }}")
+        ARGS+=(--max-hosts "${{ inputs.max-hosts }}")
+        ARGS+=(--workers "${{ inputs.workers }}")
+        ARGS+=(--concurrency "${{ inputs.concurrency }}")
+        ARGS+=(--adaptive-max-concurrency "${{ inputs.adaptive-max-concurrency }}")
+        ARGS+=(--output "${{ inputs.output-format }}" --output-file "${{ inputs.output-file }}")
+        ARGS+=(--no-progress)
+        ARGS+=(${{ inputs.extra-args }})
+
+        echo "[*] portscanner ${ARGS[@]}"
+        portscanner "${ARGS[@]}"
+
+        # Stream-count results instead of loading the whole file into memory:
+        # works for both ndjson (one JSON object per line, "type":"result")
+        # and json (a single {"results": [...]} document) without ever
+        # holding more than one record in memory at a time.
+        python3 - "${{ inputs.output-format }}" "${{ inputs.output-file }}" >> "$GITHUB_OUTPUT" << 'PYEOF'
+        import json, sys
+
+        fmt, path = sys.argv[1], sys.argv[2]
+        open_count = scanned = confirmed = 0
+
+        if fmt == "ndjson":
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    if rec.get("type") != "result":
+                        continue
+                    scanned += 1
+                    if rec.get("state") == "open":
+                        open_count += 1
+                    if rec.get("protocol"):
+                        confirmed += 1
+        elif fmt == "json":
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for r in data.get("results", []):
+                scanned += 1
+                if r.get("state") == "open":
+                    open_count += 1
+                if r.get("protocol"):
+                    confirmed += 1
+        else:
+            # table/csv: skip counting, outputs will be zero
+            pass
+
+        print(f"open-count={open_count}")
+        print(f"scanned-count={scanned}")
+        print(f"confirmed-count={confirmed}")
+        PYEOF
+
+        echo "results-file=${{ inputs.output-file }}" >> "$GITHUB_OUTPUT"
+        {
+          echo "### Telecom Signaling Scan Results"
+          echo "- Output format: \`${{ inputs.output-format }}\`"
+          echo "- Results file: \`${{ inputs.output-file }}\`"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload results artifact
+      # always() (not just success()) so partial results are still
+      # uploaded if the scan step times out, is cancelled, or the
+      # "Fail if unexpected exposure found" check in your own workflow
+      # exits non-zero — ndjson already has every result written up
+      # to that point, no reason to lose it just because a later step
+      # in the job failed.
+      if: always() && steps.scan.outputs.results-file != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: portscanner-results
+        path: ${{ inputs.output-file }}
+        retention-days: 14
+        if-no-files-found: warn

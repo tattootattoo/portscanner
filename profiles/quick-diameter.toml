@@ -1,0 +1,5 @@
+# A quick Diameter-only scan (TCP+TLS), no progress bar — suited for CI/scripts
+[scan]
+ports = "3868,3869"
+transport = "tcp"
+no_progress = true

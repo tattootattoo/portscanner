@@ -1,0 +1,11 @@
+# A profile suited for running as a periodic GitHub Actions step (see
+# action.yml and .github/workflows/example-monitor.yml.example) — fast,
+# no progress bar, and JSON results that are comparable across
+# consecutive runs.
+[scan]
+transport = "all"
+no_two_phase = false     # two-phase scanning is enabled (already the default)
+fast_timeout = 0.5
+retries = 1
+output = "json"
+no_progress = true

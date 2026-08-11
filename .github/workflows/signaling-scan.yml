@@ -1,0 +1,260 @@
+# Signaling exposure scan — resumable version.
+#
+# Large target lists (tens of thousands of hosts, SCTP/SIGTRAN handshakes
+# and retries included) can genuinely take longer than a single GitHub
+# Actions job is allowed to run. GitHub-hosted runners have a **hard**
+# 360-minute (6h) per-job ceiling that no timeout-minutes value can
+# raise — see https://docs.github.com/actions/reference/usage-limits-billing-and-administration#usage-limits.
+# Self-hosted runners can go up to 5 days, so if you consistently need
+# more than one chunked run, that's the real fix (see runs-on below).
+#
+# Instead of hoping one job finishes in time, this workflow:
+#   1. Splits the (expanded) target list into fixed-size chunks.
+#   2. Scans chunks in order, checkpointing progress after each one.
+#   3. If it's getting close to the job's own time budget with chunks
+#      still left, it uploads its progress as an artifact and dispatches
+#      a fresh run of itself to pick up where it left off — instead of
+#      relying on the job surviving to the hard ceiling.
+#   4. Repeats until every chunk is done (or max-iterations is hit,
+#      which is a safety cap, not a formality — see that input below).
+#
+# Before enabling:
+#   1. Put your target list in targets.txt (one host/CIDR/range per
+#      line — see targets.txt.example) — only hosts you own or are
+#      explicitly authorized to scan.
+#   2. Set max-hosts below to match your actual target count. It's a
+#      safety cap, not a formality — don't raise it past the real size
+#      of your authorized target list.
+#   3. If your targets are on a private network (not internet-reachable
+#      from GitHub's hosted runners), switch runs-on to a self-hosted
+#      runner that has network access to them — that also removes the
+#      360-minute ceiling entirely (see the top comment).
+
+name: Signaling Exposure Scan (Resumable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hosts-file:
+        description: "Path to targets file in the repo"
+        default: "targets.txt"
+        required: false
+      max-hosts:
+        description: "Safety cap on expanded host count — set to match your real, authorized target list"
+        default: "50000"
+        required: false
+      chunk-size:
+        description: "Hosts scanned per checkpoint. Smaller = safer resume granularity, more overhead; larger = fewer checkpoints, more rework if a chunk gets killed mid-way"
+        default: "200"
+        required: false
+      max-iterations:
+        description: "Safety cap on how many times this workflow may re-dispatch itself for one scan. Not a formality: it bounds worst-case Actions-minutes if something is pathologically slow (e.g. a dead host with a long connect-timeout on every port). Raise it deliberately, matching how many chunks you actually expect to need."
+        default: "10"
+        required: false
+      # --- internal continuation state — do not set these by hand ---
+      iteration:
+        description: "internal: current chain position (leave as 1)"
+        default: "1"
+        required: false
+      resume-run-id:
+        description: "internal: run id to pull checkpoint state from"
+        default: ""
+        required: false
+  # Uncomment once you've confirmed a manual chain finishes comfortably
+  # within max-iterations and you're ready for it to run unattended:
+  # schedule:
+  #   - cron: "0 3 * * *"   # once a day, 03:00 UTC
+
+permissions:
+  contents: read
+  actions: write   # required to download a previous run's artifact and to self-dispatch the next chunk
+
+# Only one scan chain per ref at a time — a second manual trigger while
+# one is already resuming would otherwise race it over the same state.
+concurrency:
+  group: signaling-scan-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TRANSPORT: all
+  WORKERS: "4"
+  CONCURRENCY: "500"
+  ADAPTIVE_MAX_CONCURRENCY: "1500"
+  ENABLE_SCTP: "true"
+  EXTRA_ARGS: "--retries 1 --fast-timeout 0.75 --min-delay-per-host 0.05"
+  # Job timeout below the platform's 360-min hard ceiling, and the
+  # in-job soft budget (comfortably below that) at which this run stops
+  # starting new chunks and hands off to a fresh run instead of racing
+  # the hard kill. Keep SOFT_DEADLINE_MINUTES meaningfully under
+  # timeout-minutes — it needs headroom to upload the checkpoint
+  # artifact and dispatch the next run after the last chunk finishes.
+  JOB_TIMEOUT_MINUTES: "350"
+  SOFT_DEADLINE_MINUTES: "325"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest   # switch to self-hosted for private targets or to remove the 360-min ceiling
+    timeout-minutes: 350     # keep in sync with env.JOB_TIMEOUT_MINUTES above
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install portscanner
+        run: pip install -e .
+
+      - name: Enable real SCTP support (for SIGTRAN)
+        if: env.ENABLE_SCTP == 'true'
+        run: |
+          set -e
+          for i in 1 2 3; do
+            if sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends lksctp-tools libsctp-dev; then
+              break
+            fi
+            if [ "$i" = "3" ]; then
+              echo "::warning::apt-get failed 3 times — continuing without lksctp-tools; SIGTRAN protocols will report ERROR."
+            else
+              sleep 5
+            fi
+          done
+          sudo modprobe sctp || echo "::warning::failed to load the sctp kernel module — SIGTRAN protocols will report ERROR."
+
+      - name: Restore checkpoint from previous run
+        if: inputs.iteration != '1'
+        uses: actions/download-artifact@v4
+        with:
+          name: signaling-scan-state
+          run-id: ${{ inputs.resume-run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: .
+
+      - name: Prepare chunks (first iteration only)
+        if: inputs.iteration == '1'
+        run: |
+          set -e
+          mkdir -p chunks results
+          total=$(python scripts/split_targets.py "${{ inputs.hosts-file }}" "${{ inputs.chunk-size }}" "${{ inputs.max-hosts }}" chunks)
+          echo "cursor=0" > state.env
+          echo "total_chunks=$total" >> state.env
+          : > results/merged.ndjson
+          echo "[*] split into $total chunk(s) of up to ${{ inputs.chunk-size }} host(s) each"
+
+      - name: Scan chunks until done or soft deadline
+        id: run
+        run: |
+          set -e
+          source state.env
+          deadline=$(( ${{ env.SOFT_DEADLINE_MINUTES }} * 60 ))
+          stopped_early=false
+
+          echo "[*] resuming at chunk $cursor / $total_chunks"
+
+          while [ "$cursor" -lt "$total_chunks" ]; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "[*] soft deadline reached with $((total_chunks - cursor)) chunk(s) left — handing off to a new run"
+              stopped_early=true
+              break
+            fi
+
+            chunk_file=$(printf "chunks/chunk_%04d.txt" "$cursor")
+            part_file=$(printf "results/part_%04d.ndjson" "$cursor")
+            echo "[*] scanning chunk $cursor: $(wc -l < "$chunk_file") host(s)"
+
+            portscanner \
+              --hosts-file "$chunk_file" \
+              --transport "${{ env.TRANSPORT }}" \
+              --max-hosts "${{ inputs.chunk-size }}" \
+              --workers "${{ env.WORKERS }}" \
+              --concurrency "${{ env.CONCURRENCY }}" \
+              --adaptive-max-concurrency "${{ env.ADAPTIVE_MAX_CONCURRENCY }}" \
+              --output ndjson --output-file "$part_file" \
+              --no-progress ${{ env.EXTRA_ARGS }}
+
+            cat "$part_file" >> results/merged.ndjson
+            cursor=$((cursor + 1))
+            echo "cursor=$cursor" > state.env
+            echo "total_chunks=$total_chunks" >> state.env
+          done
+
+          echo "stopped-early=$stopped_early" >> "$GITHUB_OUTPUT"
+          echo "cursor=$cursor" >> "$GITHUB_OUTPUT"
+          echo "total-chunks=$total_chunks" >> "$GITHUB_OUTPUT"
+
+      - name: Upload checkpoint
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signaling-scan-state
+          path: |
+            state.env
+            chunks/
+            results/merged.ndjson
+          retention-days: 3
+
+      - name: Dispatch next iteration
+        if: steps.run.outputs.stopped-early == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          next=$(( ${{ inputs.iteration }} + 1 ))
+          if [ "$next" -gt "${{ inputs.max-iterations }}" ]; then
+            echo "::error::max-iterations (${{ inputs.max-iterations }}) reached with ${{ steps.run.outputs.total-chunks }} - ${{ steps.run.outputs.cursor }} chunk(s) still unscanned. Re-run manually with a higher max-iterations (and resume-run-id=${{ github.run_id }}, iteration=$next) once you've confirmed the per-chunk time is expected, not a stuck host."
+            exit 1
+          fi
+          gh workflow run signaling-scan.yml \
+            --ref "${{ github.ref_name }}" \
+            -f hosts-file="${{ inputs.hosts-file }}" \
+            -f max-hosts="${{ inputs.max-hosts }}" \
+            -f chunk-size="${{ inputs.chunk-size }}" \
+            -f max-iterations="${{ inputs.max-iterations }}" \
+            -f iteration="$next" \
+            -f resume-run-id="${{ github.run_id }}"
+          echo "[*] dispatched iteration $next to continue from chunk ${{ steps.run.outputs.cursor }}"
+
+      - name: Report (final iteration only)
+        if: steps.run.outputs.stopped-early == 'false'
+        run: |
+          python3 - << 'PYEOF'
+          import json
+          scanned = open_count = confirmed = 0
+          with open("results/merged.ndjson", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  rec = json.loads(line)
+                  if rec.get("type") != "result":
+                      continue
+                  scanned += 1
+                  if rec.get("state") == "open":
+                      open_count += 1
+                  if rec.get("protocol"):
+                      confirmed += 1
+          print(f"scanned:   {scanned}")
+          print(f"open:      {open_count}")
+          print(f"confirmed: {confirmed}")
+          with open("counts.env", "w") as f:
+              f.write(f"open_count={open_count}\n")
+          PYEOF
+
+      - name: Fail if unexpected exposure found
+        if: steps.run.outputs.stopped-early == 'false'
+        run: |
+          source counts.env
+          if [ "$open_count" -gt 20 ]; then   # adjust the expected threshold for your network
+            echo "::error::number of open signaling ports higher than expected: $open_count"
+            exit 1
+          fi
+
+      - name: Upload final merged results
+        if: steps.run.outputs.stopped-early == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signaling-scan-results
+          path: results/merged.ndjson
+          retention-days: 30

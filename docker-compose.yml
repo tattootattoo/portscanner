@@ -1,0 +1,12 @@
+services:
+  portscanner:
+    build: .
+    # SYS_MODULE + NET_ADMIN are needed for modprobe sctp to work from
+    # inside the container on the host. If SCTP is already loaded on
+    # the host, you can remove both and run normally.
+    cap_add:
+      - SYS_MODULE
+      - NET_ADMIN
+    network_mode: host
+    entrypoint: ["/usr/local/bin/docker-entrypoint.sh"]
+    command: ["portscanner", "--help"]

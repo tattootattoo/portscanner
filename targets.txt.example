@@ -1,0 +1,17 @@
+# Sample targets file for portscanner --hosts-file / the action's hosts-file input.
+# One entry per line. Blank lines and lines starting with # are ignored.
+# Supported forms (each expands under the --max-hosts cap):
+#   - a single IP or domain:      10.0.0.5
+#   - a CIDR block:                10.0.1.0/24
+#   - an inclusive IP range:       10.0.2.10-10.0.2.250
+#
+# For tens of thousands of targets, prefer several precise CIDR blocks
+# over one huge one — it keeps the file readable and makes it easy to
+# comment out a subnet temporarily without touching the rest.
+
+10.10.0.0/22
+10.10.4.0/23
+10.20.0.0/24
+hss01.core.example.net
+pgw-gi.core.example.net
+10.30.10.1-10.30.10.60
